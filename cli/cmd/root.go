@@ -11,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 
-	"github.com/dsx-ai-factory/workload-map/pkg/version"
+	"github.com/dsx-ai-factory/workload-map/karta/sdk/pkg/version"
 )
 
 // NewRootCommand builds the root command for the kli binary. Global flags are
@@ -62,6 +62,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.SetFlagErrorFunc(usageError)
 
 	kubeFlags.AddFlags(cmd.PersistentFlags())
+	cobra.CheckErr(cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces))
 	withOutput(cmd, cmd.PersistentFlags(), true)
 	withConfig(cmd)
 
