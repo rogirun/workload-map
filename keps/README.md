@@ -56,4 +56,4 @@ updates, open a new issue if the original is closed.
 
 ## Index
 
-No KEPs have been added yet.
+- [KEP-0002: Pending, Progressing, and minimal viable Running](0002-pending-progressing-status/README.md)
