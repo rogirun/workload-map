@@ -203,9 +203,89 @@ expressed in CEL.
 
 M3. Selector sourced from the workload. This extends M2.
 
-Deployment, StatefulSet and similar types select their pods with their own
-`spec.selector`. A label value per key cannot express that. The references
-design lists whole-selector sourcing as out of scope. This KEP needs it.
+In M2, a `list` reference fixes the label keys when the definition is
+written. Only the values can come from the workload. That works when the
+controller stamps every pod with a known label carrying the workload's name:
+
+```yaml
+# JobSet: the controller adds jobset.sigs.k8s.io/jobset-name to every pod.
+# The key is known in advance; only the value comes from the workload.
+list:
+  matchLabels:
+    jobset.sigs.k8s.io/jobset-name: {expression: object.metadata.name}
+```
+
+Deployment and StatefulSet do not stamp such a label. Their pods carry the
+labels the user wrote in the pod template, and the workload finds them
+through its own `spec.selector`. The keys differ from one workload to the
+next:
+
+```yaml
+# Deployment A
+kind: Deployment
+metadata: {name: llama-serving}
+spec:
+  selector:
+    matchLabels: {app: llama, tier: inference}
+  template:
+    metadata:
+      labels: {app: llama, tier: inference}
+---
+# Deployment B
+kind: Deployment
+metadata: {name: embedder}
+spec:
+  selector:
+    matchLabels: {team: search}
+    matchExpressions:
+      - {key: model, operator: In, values: [bge, e5]}
+  template:
+    metadata:
+      labels: {team: search, model: bge}
+```
+
+A single `apps-deployment-v1` definition must find the pods of both. M2
+cannot express that:
+
+- `matchLabels: {app: {expression: ...}}` finds Deployment A but not B, which
+  has no `app` label.
+- No pod label carries the Deployment's name, so there is no fixed key to
+  match on.
+- Pods are owned by a ReplicaSet, not by the Deployment, so the owner
+  reference does not lead to the workload either.
+
+`selectorExpression` returns the whole selector from the workload. The
+consumer converts it to a `metav1.LabelSelector` and lists pods with it:
+
+```yaml
+# apps-deployment-v1, apps-statefulset-v1
+references:
+  - name: pods
+    gvk: {group: "", version: v1, kind: Pod}
+    list:
+      selectorExpression: object.spec.selector
+```
+
+| Workload | `selectorExpression` result | `List` the consumer issues |
+|---|---|---|
+| Deployment A | `{matchLabels: {app: llama, tier: inference}}` | `app=llama,tier=inference` |
+| Deployment B | `{matchLabels: {team: search}, matchExpressions: [{key: model, operator: In, values: [bge, e5]}]}` | `team=search,model in (bge,e5)` |
+
+The expression can also build a selector, when the controller stamps a
+known label but the definition needs a narrower set:
+
+```yaml
+# RayJob: the cluster's pods, without the submitter pod
+list:
+  selectorExpression: >-
+    {'matchLabels': {'ray.io/cluster': object.status.rayClusterName},
+     'matchExpressions': [{'key': 'ray.io/node-type', 'operator': 'Exists'}]}
+```
+
+The same RayJob selector also fits M2's `matchLabels` and `matchExpressions`.
+`selectorExpression` is required only when the keys come from the workload.
+
+API change:
 
 ```go
 type ListReference struct {
@@ -213,12 +293,22 @@ type ListReference struct {
     MatchExpressions []LabelSelectorRequirement
 
     // SelectorExpression is a CEL expression over the root object that returns
-    // a metav1.LabelSelector. Mutually exclusive with MatchLabels and
-    // MatchExpressions.
+    // a label selector in the shape of metav1.LabelSelector. Mutually exclusive
+    // with MatchLabels and MatchExpressions.
     // +kubebuilder:validation:Optional
     SelectorExpression *string `json:"selectorExpression,omitempty"`
 }
 ```
+
+Rules:
+
+- Exactly one of `selectorExpression`, or `matchLabels` and
+  `matchExpressions`, is set. The validator enforces it.
+- The result must convert to a `metav1.LabelSelector`. A result that does not
+  convert fails resolution with an error, not an empty list.
+- An empty selector is rejected. It would match every pod in the namespace.
+- The selector applies in the workload's namespace only, as for every
+  reference.
 
 M4. Status vocabulary.
 
