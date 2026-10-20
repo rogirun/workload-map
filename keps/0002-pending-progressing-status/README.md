@@ -7,7 +7,7 @@
 - Authors: @rogirun
 - Issue: https://github.com/dsx-ai-factory/workload-map/issues/347
 - Created: 2026-10-18
-- Last updated: 2026-10-18
+- Last updated: 2026-10-20
 
 ## Summary
 
@@ -47,8 +47,9 @@ The two cases also differ in cost. A pod is bound when the scheduler sets
 `spec.nodeName`. From that moment the node's allocatable resources, GPUs
 included, are charged to the pod, even while the image is still pulling. The
 kubelet only pulls images for pods already bound to its node. To an external
-viewer, `Pending` must therefore mean "not scheduled, holds nothing", the same
-meaning the Kubernetes pod phase and every queueing system give it.
+viewer, `Pending` must therefore mean "not scheduled, holds nothing", the
+meaning queueing systems give it. The pod phase `Pending` is broader: it also
+covers a bound pod that is pulling its image.
 
 `Running` has the opposite problem. Several catalog definitions report
 `Running` as soon as one pod is ready, or as soon as the workload controller
@@ -63,6 +64,18 @@ while it cannot serve (#228). `Running` must mean the workload can do its job.
 | `Running` | Minimal viable state reached | Yes, productive |
 
 A partially bound gang holds resources, so it is `Progressing`.
+
+### User stories
+
+- A platform admin sees a workload starting for an hour. `Pending` tells them
+  it waits for quota or a queue, so they act on capacity. `Progressing` tells
+  them it already holds GPUs, so they look at the pods.
+- A serving platform routes traffic only to `Running` inference workloads. An
+  LWS whose workers are unschedulable must not read `Running`.
+- A training user submits a 64-rank PyTorchJob. They need to know whether the
+  gang is still queued, partly bound, or complete.
+- A cost dashboard charges a team for workloads that hold node resources. It
+  needs `Progressing` and `Running` apart from `Pending`.
 
 ### Requirements
 
@@ -79,7 +92,7 @@ requirements. Each option below is judged against them.
 
 ### Findings
 
-Research covered the 23 catalog definitions and all 67 recorded e2e flows.
+Research covered the 23 catalog definitions and all 68 recorded e2e flows.
 
 - Most workload CRs do not carry the bound/unbound fact. Their controllers
   count pods (`active`, `readyReplicas`) without reporting scheduling. An
@@ -116,7 +129,9 @@ Research covered the 23 catalog definitions and all 67 recorded e2e flows.
   `ImagePullBackOff`, a crash before ready, and a partially bound gang whose
   remaining pods can never be scheduled. All of them read `Progressing` under
   this KEP. Detecting them is a follow-up.
-- Karta fetching anything from the cluster. Consumers keep doing all reads.
+- A Kubernetes client in status evaluation. `pkg/resource` stays
+  client-free. Reads go through the reader the consumer supplies to
+  `pkg/references`, as in the references design.
 - New features for definitions written in jq. References are bound only in
   CEL definitions.
 
@@ -136,6 +151,25 @@ keeps seeing `Initializing` where it does today. A consumer that knows the new
 values reads the refinement from the same `MatchedStatuses` list, which is
 already multi-valued. `Pending`, `Progressing` and `Running` must not match
 together.
+
+The three statuses describe startup only. A change after the workload reached
+`Running` (a rollout, a scale-up, a JobSet restart) keeps it `Running` as long
+as the minimal viable state holds. If it drops below the minimum, it reads
+`Progressing` again. Reporting "running, but changing" is out of scope. See
+Open questions.
+
+### Matcher guards
+
+Every `pending`, `progressing` and `running` matcher in the catalog applies
+these guards, so a stale or vanishing object does not report a startup state:
+
+- `status.observedGeneration` equals `metadata.generation` where the workload
+  reports it. A snapshot taken before the controller observed a spec change
+  carries old counts and resolves to `Undefined`.
+- The workload is not being deleted (`metadata.deletionTimestamp` unset).
+- Pods being deleted do not count as bound or ready.
+- A workload scaled to zero desired replicas, or a paused Deployment, matches
+  none of the three.
 
 ### Minimal viable state
 
@@ -194,9 +228,11 @@ expressed in CEL.
 - Binding: each reference is exposed to CEL as `references.<name>`. A `list`
   is a list, possibly empty. A `lookup` that finds nothing leaves the key
   absent, so `has(references.<name>)` is the existence test.
-- Bindings are lazy. A reference is resolved only when an expression that
-  reads it is evaluated. A workload whose root CR already decides its status
-  (for example `Completed`) costs no pod read.
+- Bindings are lazy per reference. A reference is resolved only when an
+  expression that reads it is evaluated. A workload whose root CR already
+  decides its status (for example `Completed`) costs no pod read. This is
+  stricter than the references design, which resolves every reference on the
+  first accessor call that needs one.
 - A validator gate rejects definitions that declare references unless the
   consumer opts in (`ErrReferencesNotSupported`), as the references design
   already proposes.
@@ -436,6 +472,8 @@ The leader pod carries the same `group-index` label as its workers, so the
 filter counts the leader once. A group of size 4 with the leader and one
 worker ready is `Progressing`, not `Running`.
 
+The examples omit the matcher guards for brevity.
+
 #### Example: JobSet, queue and training gang
 
 ```yaml
@@ -564,27 +602,27 @@ CRD changes: M4 only.
 Why it is partial. It meets R1 for 5 of 23 definitions and partially for 2
 more. It meets R3 only where the CR counts readiness per component.
 
-| Definition | What option A gives | Requirement missed and why |
-|---|---|---|
-| Pod | Full split from `PodScheduled` | None |
-| Agent Sandbox | Full split from the mirrored `PodScheduled` | None |
-| CronJob | `Pending` before the first tick | None. No pods exist in that state. |
-| RayJob, RayCluster | Split from `HeadPodReady`. Reason `Unknown` means the head pod has no `PodReady` condition, which the kubelet adds only after binding. | R1: workers bound before the head read `Pending` for a moment. R3: worker group minimums are not on the CR. R4: Kueue-queued reads `Suspended`. |
-| RayService | Nothing for R1. `Running` on `Ready=True` is already minimal viable. | R1: `Ready=False` with reason `Initializing` hides both cases. |
-| Knative Service | `Progressing` when `ConfigurationsReady=True` and only networking is left | R1: `RevisionMissing` is ambiguous. An unschedulable revision is expected to surface as `ConfigurationsReady=False`, which maps to `Failed`. |
-| Deployment | `Pending` on `ReplicaFailure=True` with no pod created (quota). `Running` on one ready replica. | R1: unschedulable pods are invisible. `Progressing=True` holds until `ProgressDeadlineExceeded` turns it `Failed` after 600s by default. |
-| StatefulSet | `Running` on one ready replica | R1: only replica counts. |
-| Job | `Running` on one ready pod (unchanged) | R1: `active` counts unbound pods too. R4: Kueue-queued reads `Suspended`. |
-| JobSet | `Running` when every replicated job is fully ready | R1: `active` counts unbound pods too. R4: Kueue. |
-| PyTorchJob | Nothing | R1: `Created=True` only means pods were submitted. R3: `replicaStatuses.active` counts running, not ready, pods per type. R4: Kueue. |
-| MPIJob | `Running` from the `Running` condition, if it requires every worker (verify) | R1: `Created=True` only means pods were submitted. R4: Kueue. |
-| LeaderWorkerSet | Nothing | R1: `Progressing=True` with reason `GroupsProgressing` throughout. R3: `readyReplicas` and `Available=True` count a group ready off its leader (#228). |
-| LLMInferenceService | Nothing | R1: `Ready=False` reasons copy the Deployment's (`MinimumReplicasUnavailable`). R3: multi-node groups have the LWS gap. |
-| KServe InferenceService | Nothing for R1 | R1: no starting mapping exists. `Ready=Unknown` covers both cases. |
-| Dynamo | `Running` from per-service `readyReplicas` for single-node services | R1: per-service replica counts only. R3: multi-node replicas have the LWS gap. |
-| Grove PodCliqueSet | `Running` on `availableReplicas >= 1` | R1: `availableReplicas` only. Scheduling counts live on child `PodClique` objects. |
-| NIMService, NIMCache | Nothing for R1 | R1: state `NotReady` with a rollout message only. |
-| Milvus | `Running` from `componentsDeployStatus` (verify) | R1: `status: Pending` covers everything. The rest is in condition messages. |
+- R1 met: Pod and Agent Sandbox (`PodScheduled`), CronJob (no pods before the
+  first tick), RayJob and RayCluster from `HeadPodReady`. Reason `Unknown`
+  means the head pod has no `PodReady` condition, which the kubelet adds only
+  after binding. Workers bound before the head still read `Pending` for a
+  moment.
+- R1 partial: Deployment reads `Pending` on `ReplicaFailure=True` with no pod
+  created (quota), but unschedulable pods are invisible. Knative reads
+  `Progressing` once only networking is left, but `RevisionMissing` is
+  ambiguous.
+- R1 missed, counts only: StatefulSet, Job, JobSet, Dynamo, Grove, Milvus.
+  Their counts (`active`, `readyReplicas`, `availableReplicas`) include
+  unbound pods or cover only ready ones.
+- R1 missed, conditions hide it: PyTorchJob and MPIJob (`Created=True` only
+  means pods were submitted), LeaderWorkerSet (`Progressing=True` throughout),
+  LLMInferenceService, RayService, KServe InferenceService, NIMService and
+  NIMCache.
+- R3 missed: LeaderWorkerSet counts a group ready off its leader (#228).
+  PyTorchJob counts running, not ready, pods per type. RayCluster worker
+  group minimums are not on the CR. Multi-node Dynamo and LLMInferenceService
+  replicas have the LWS gap.
+- R4 missed: every Kueue-capable type reads `Suspended` while queued.
 
 R5 is reachable for the definitions it covers, with new fixtures.
 
@@ -627,25 +665,20 @@ root reports `Initializing` while starting. Why it is still partial:
 - The rule is fixed in Go. A definition cannot adapt it, and the Go API is
   superseded once references land.
 
-| Definition | What option B gives | Requirement missed and why |
-|---|---|---|
-| Pod, Agent Sandbox, CronJob | Same as option A | None |
-| Deployment, StatefulSet | Split for the first rollout | None, given correct attribution by the consumer |
-| Job | Split | R4: Kueue-queued stays `Suspended`. |
-| JobSet | Split | R4: Kueue. |
-| PyTorchJob | Split | R3: no per-type readiness for `running`. R4: Kueue. |
-| MPIJob | Split | R4: Kueue. |
-| LeaderWorkerSet | Split | R3: `Running` still counts a group ready off its leader (#228). |
-| RayCluster | Nothing | R1, R2: the root reports `Undefined` while starting, so the rule never runs. R3: worker group minimums. R4: Kueue. |
-| RayJob | Split while `jobDeploymentStatus` is `Initializing` | R1: the root reports `Undefined` while `jobDeploymentStatus` is `Running` without `jobStatus`. R3, R4: as RayCluster. |
-| RayService | Split | None for R1. Pods of the active and the pending cluster are mixed during an upgrade. |
-| Knative Service | Split | R1: an unschedulable revision maps to `Failed` on the root before the rule runs. |
-| KServe InferenceService | Nothing | R1, R2: the root reports `Undefined` while starting. |
-| LLMInferenceService | Split | R3: multi-node groups have the LWS gap. |
-| Dynamo | Split | R3: multi-node replicas have the LWS gap. |
-| Grove PodCliqueSet | Split. Gated pods read `Pending`. | None, given correct attribution. |
-| NIMService | Split once the state is `NotReady` | R1: during model caching (`PVC-Created`) the root reports `Undefined`. |
-| NIMCache, Milvus | Split | None for R1, given correct attribution. Milvus dependency pods (etcd, MinIO) are part of the workload and count as bound. |
+Per workload:
+
+- R1 met, given correct attribution by the consumer: Pod, Agent Sandbox,
+  CronJob, Deployment and StatefulSet (first rollout), Job, JobSet,
+  PyTorchJob, MPIJob, LeaderWorkerSet, RayService, LLMInferenceService,
+  Dynamo, Grove (gated pods read `Pending`), NIMCache and Milvus. Milvus
+  dependency pods (etcd, MinIO) count as bound.
+- R1 and R2 missed, the root starts in `Undefined`: RayCluster, KServe
+  InferenceService, RayJob while `jobDeploymentStatus` is `Running` without
+  `jobStatus`, NIMService in state `PVC-Created`.
+- R1 missed, another status wins first: Knative maps an unschedulable
+  revision to `Failed` before the rule runs.
+- R3 missed: as option A.
+- R4 missed: as option A.
 
 R5 needs the recorder to capture pods, the same schema bump as M6.
 
@@ -674,6 +707,15 @@ R5 needs the recorder to capture pods, the same schema bump as M6.
    R1 for most types early, at the cost of a Go API that references supersede.
    See Open questions.
 
+Exit criteria:
+
+| Milestone | Done when |
+|---|---|
+| M4 and option A | `Pending` and `Progressing` are in the API, `kli get --phase` accepts them, and every option A definition has a recorded unschedulable flow. |
+| Holistic path, per definition | The definition uses CEL and a `pods` reference, its fixtures prove `Pending`, `Progressing` and `Running`, and the co-match test passes on its recordings. |
+| Holistic path, complete | Every catalog definition is migrated and no definition reports `Initializing` alone. |
+| Deprecating `Initializing` | Out of scope. A later KEP may propose it once the holistic path is complete and consumers have moved to the refinements. |
+
 ## Compatibility and migration
 
 - CRD: every change is additive. M1 adds `expressionLanguage`, M2 and M3 add
@@ -698,6 +740,74 @@ R5 needs the recorder to capture pods, the same schema bump as M6.
   `Suspended`. That changes an existing state and is called out in the
   release notes. See Open questions.
 
+### Enablement and rollback
+
+Every part is opt-in per definition. A definition opts in with
+`pending:`/`progressing:` (M4), with `expressionLanguage: cel` (M1), and with
+`references` (M2). There is no global switch. To roll a workload type back,
+apply the previous definition. To keep CEL but drop the pod reads, apply a
+CEL definition without `references` and without the matchers that read them.
+It then behaves as option A: the root CR decides alone. Removing only the
+`references` block fails the compile check in M5.
+
+### Upgrade and downgrade
+
+- Upgrade order: CRD, then SDK consumers (operator, `kli`, platforms), then
+  catalog definitions. A definition that uses the new fields must not be
+  applied before the CRD that knows them.
+- Downgrade in reverse order: catalog first, then consumers, then the CRD.
+  Downgrading the catalog only (same CRD) restores today's statuses exactly,
+  including Kueue-queued workloads reading `Suspended`.
+- Downgrading the CRD while CEL definitions are stored prunes
+  `expressionLanguage` and `references`. Their expressions are then read as
+  jq and fail, so those workloads report `Undefined`. This is why the catalog
+  goes first.
+- For jq definitions with option A matchers, a CRD downgrade prunes
+  `pending` and `progressing` only. They fall back to their `initializing`
+  matchers. The catalog keeps `initializing` matchers next to the refinements
+  for this reason. `matchStatus` reports `Initializing` once when both match.
+
+### Version skew
+
+| Skew | Behavior |
+|---|---|
+| New jq definition (option A), old SDK consumer | The consumer ignores the unknown `pending` and `progressing` fields and reports `Initializing` from the definition's `initializing` matchers. No error. |
+| New CEL definition, consumer without M1 | The consumer ignores `expressionLanguage`, evaluates the CEL expressions as jq, and fails. The catalog moves a definition to CEL only after the supported consumers have M1. |
+| Old consumer receives `Pending` or `Progressing` in `MatchedStatuses` (for example through a platform API built on the SDK) | It still finds `Initializing` in the same list. A consumer that rejects unknown values must be upgraded first. |
+| New SDK, consumer without a reference reader | The validator gate rejects definitions with references (`ErrReferencesNotSupported`), or the consumer passes pre-resolved values. It never reports a refinement from missing data. |
+| New `kli`, old catalog | `--phase Pending` and `--phase Progressing` return no workloads until the catalog is upgraded. |
+
+### RBAC
+
+The Karta operator reconciles Karta objects only and needs no new rule. Every
+consumer that evaluates a definition with references reads the referenced
+objects with its own identity:
+
+- `list` on `pods` in the workload's namespace, for the `pods` reference.
+- `list` on `workloads.kueue.x-k8s.io`, where a definition references the Kueue
+  `Workload`.
+
+A `kli` user who can list the workload but not its pods gets `Initializing`,
+not an error. Platforms that run the SDK in a controller add these rules to
+their own role. The references design owns the general rule; this KEP adds the
+two resources above.
+
+## Monitoring and troubleshooting
+
+- A reference that fails to resolve (forbidden, timeout, invalid selector)
+  leaves the refinement unmatched, so the workload reads `Initializing`, and
+  the SDK returns the resolution error to the consumer. It never guesses
+  `Pending`.
+- A CEL expression over its cost budget fails the same way, with an error
+  naming the definition and the matcher.
+- `kli describe` shows which matcher produced each status, the number of pods
+  bound and ready per component, and the pod reason for unbound pods
+  (`PodScheduled=False` reason and message), so "why is this `Progressing`"
+  has an answer.
+- Overlapping `pending`, `progressing` and `running` matchers are caught by
+  the co-match replay test in CI, not at runtime. Runtime metrics for
+  resolution errors and evaluation cost belong to the metrics exporter KEP.
+
 ## Test plan
 
 - API: `Entries()` covers the new statuses. `matchStatus` adds the
@@ -713,6 +823,14 @@ R5 needs the recorder to capture pods, the same schema bump as M6.
   unschedulable must stay `Progressing`.
 - SDK: reference resolution, lazy binding, the validator gate, and CEL compile
   checks for undeclared references.
+- Guards: replay snapshots with a stale `observedGeneration`, a deletion
+  timestamp, and zero desired replicas match none of the three statuses.
+- Skew: a definition with the new fields evaluated by the previous SDK release
+  reports `Initializing`.
+- Infrastructure: the recording cluster needs Kueue with a `ClusterQueue`
+  smaller than one fixture, a `ResourceQuota` for the quota fixtures, and a
+  node label no node carries for the unschedulable fixtures. GPU-free fixtures
+  are enough. An impossible extended-resource request stands in for GPUs.
 
 ## Risks and alternatives
 
@@ -757,6 +875,12 @@ R5 needs the recorder to capture pods, the same schema bump as M6.
   for an LWS whose workers are independent), or does it copy the definition?
 - Does option A ship for jq definitions only, or wait for M1 so the catalog is
   migrated once?
+- Should a change after `Running` (a rollout, a scale-up, a restart) be
+  visible, for example as `Running` plus a separate updating signal, without
+  breaking the rule that `Pending`, `Progressing` and `Running` are exclusive?
+  Native signals exist for several types: Deployment `Progressing`, RayService
+  `UpgradeInProgress`, Grove and LWS `UpdateInProgress`, JobSet
+  `RestartingJobSet`.
 
 ## Appendix: catalog gaps found during research
 
@@ -774,3 +898,13 @@ These are independent of this KEP and can go straight to PRs.
 ## History
 
 - 2026-10-18: Proposal opened.
+- 2026-10-18: Decided that any bound pod makes a workload `Progressing`, so a
+  partially bound gang is `Progressing`, not `Pending`.
+- 2026-10-18: Decided that `Running` is the minimal viable state, expressed in
+  the `running` matcher with no new CRD field. Between the minimum and the
+  desired count the workload is `Running`; `Degraded` is unchanged.
+- 2026-10-18: Decided to keep `Initializing` as an umbrella reported with
+  either refinement, instead of deprecating it.
+- 2026-10-19: Added user stories, matcher guards, the startup-only scope of
+  the three statuses, compatibility detail (enablement, upgrade, skew, RBAC),
+  monitoring, and exit criteria. Collapsed the per-workload option tables.
